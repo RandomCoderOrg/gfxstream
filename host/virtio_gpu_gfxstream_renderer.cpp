@@ -17,9 +17,14 @@ extern "C" {
 #include "gfxstream/virtio-gpu-gfxstream-renderer.h"
 }  // extern "C"
 
+#include <cerrno>
 #include <cstdint>
 #include <optional>
 #include <string_view>
+
+#if defined(__ANDROID__)
+#include <android/hardware_buffer.h>
+#endif
 
 #include "frame_buffer.h"
 #include "gfxstream/strings.h"
@@ -441,6 +446,30 @@ VG_EXPORT void stream_renderer_flush(uint32_t res_handle) {
     GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_STREAM_RENDERER_CATEGORY, "stream_renderer_flush()");
 
     sFrontend()->flushResource(res_handle);
+}
+
+VG_EXPORT int stream_renderer_resource_send_hardware_buffer(uint32_t res_handle, int socket_fd) {
+#if defined(__ANDROID__)
+    if (socket_fd < 0) {
+        return -EINVAL;
+    }
+
+    struct stream_renderer_handle handle = {};
+    const int export_result = sFrontend()->exportBlob(res_handle, &handle);
+    if (export_result != 0) {
+        return export_result;
+    }
+    if (handle.handle_type != STREAM_HANDLE_TYPE_PLATFORM_AHB || handle.os_handle == 0) {
+        return -ENOTSUP;
+    }
+
+    auto* hardware_buffer = reinterpret_cast<AHardwareBuffer*>(handle.os_handle);
+    return AHardwareBuffer_sendHandleToUnixSocket(hardware_buffer, socket_fd);
+#else
+    (void)res_handle;
+    (void)socket_fd;
+    return -ENOTSUP;
+#endif
 }
 
 VG_EXPORT int stream_renderer_create_blob(uint32_t ctx_id, uint32_t res_handle,

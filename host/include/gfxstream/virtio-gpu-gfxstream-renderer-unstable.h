@@ -61,6 +61,11 @@ VG_EXPORT void gfxstream_backend_setup_window(void* native_window_handle, int32_
 
 VG_EXPORT void stream_renderer_flush(uint32_t res_handle);
 
+// Sends an Android AHardwareBuffer-backed resource to a connected Unix socket.
+// The receiver owns the reference returned by AHardwareBuffer_recvHandleFromUnixSocket.
+// Returns -ENOTSUP outside Android or when the resource is not AHardwareBuffer-backed.
+VG_EXPORT int stream_renderer_resource_send_hardware_buffer(uint32_t res_handle, int socket_fd);
+
 VG_EXPORT void* stream_renderer_platform_create_shared_egl_context(void);
 VG_EXPORT int stream_renderer_platform_destroy_shared_egl_context(void*);
 
