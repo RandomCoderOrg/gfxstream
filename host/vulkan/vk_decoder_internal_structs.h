@@ -123,6 +123,10 @@ public:
     PrivateMemory(size_t alignment, size_t size) {
 #ifdef _WIN32
         mAddr = _aligned_malloc(size, alignment);
+#elif defined(__ANDROID__) && __ANDROID_API__ < 28
+        if (posix_memalign(&mAddr, alignment, size)) {
+            mAddr = nullptr;
+        }
 #else
         mAddr = aligned_alloc(alignment, size);
 #endif

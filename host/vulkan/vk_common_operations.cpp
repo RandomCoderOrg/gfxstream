@@ -2201,6 +2201,11 @@ bool VkEmulation::allocExternalMemory(VulkanDispatch* vk, VkEmulation::ExternalM
             VkDeviceSize alignedSize = ALIGN(allocInfo.allocationSize, alignment);
 #ifdef _WIN32
         void* hostAllocation = _aligned_malloc(alignedSize, alignment);
+#elif defined(__ANDROID__) && __ANDROID_API__ < 28
+        void* hostAllocation = nullptr;
+        if (posix_memalign(&hostAllocation, alignment, alignedSize)) {
+            hostAllocation = nullptr;
+        }
 #else
         void* hostAllocation = aligned_alloc(alignment, alignedSize);
 #endif

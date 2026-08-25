@@ -21,7 +21,7 @@
 #include "gfxstream/synchronization/Lock.h"
 #include "gfxstream/common/logging.h"
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 #include <GL/glx.h>
 #elif defined(WIN32)
 #include <windows.h>

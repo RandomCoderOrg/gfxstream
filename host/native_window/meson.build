@@ -22,6 +22,9 @@ elif host_machine.system() == 'darwin'
 elif host_machine.system() == 'windows'
   files_lib_host_native_window += files('native_sub_window_win32.cpp')
   includes_lib_host_native_window += [inc_opengl_headers]
+elif host_machine.system() == 'android'
+  files_lib_host_native_window += files('native_sub_window_android.cpp')
+  includes_lib_host_native_window += [inc_opengl_headers]
 elif host_machine.system() == 'linux' and use_gles
   files_lib_host_native_window += files('native_sub_window_x11.cpp')
   includes_lib_host_native_window += [inc_opengl_headers]

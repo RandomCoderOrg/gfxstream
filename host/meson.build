@@ -122,7 +122,10 @@ if use_vulkan
   link_gfxstream_backend += lib_vulkan_server
 endif
 
-if use_composer
+# The GLES render thread always decodes renderControl commands. AOSP's
+# Android.bp wires this archive independently, but the standalone Meson build
+# previously added it only when the optional composer was selected.
+if use_gles or use_composer
   subdir('renderControl_dec')
   link_gfxstream_backend += lib_composer
 endif
@@ -163,6 +166,14 @@ elif host_machine.system() == 'qnx'
     qnx_egl_dep,
     qnx_gles2_dep,
     qnx_screen_dep,
+  ]
+elif host_machine.system() == 'android'
+  deps_gfxstream_backend += [
+    cc.find_library('android', required : true),
+    cc.find_library('EGL', required : true),
+    cc.find_library('GLESv2', required : true),
+    cc.find_library('log', required : true),
+    cc.find_library('vulkan', required : true),
   ]
 endif
 

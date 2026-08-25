@@ -19,11 +19,11 @@
 
 /* MESA: A hack to avoid #ifdefs in driver code. */
 #if defined(ANDROID)
-#include <cutils/native_handle.h>
 #include <vulkan/vulkan.h>
 
-#if ANDROID_API_LEVEL < 28
+#if __ANDROID_API__ < 28
 /* buffer_handle_t was defined in the deprecated system/window.h */
+typedef struct native_handle native_handle_t;
 typedef const native_handle_t* buffer_handle_t;
 #endif
 
