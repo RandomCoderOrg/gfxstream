@@ -3098,6 +3098,14 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     }
 
     bool useDedicated = mUseDedicatedAllocations;
+#if defined(__ANDROID__)
+    // Vulkan requires memory imported from an AHardwareBuffer and bound to an
+    // image to use a dedicated allocation. This requirement is intrinsic to
+    // AHB imports and does not depend on VkMemoryDedicatedRequirements.
+    if (getExternalMemoryMode() == ExternalMemory::Mode::AndroidAHB) {
+        useDedicated = true;
+    }
+#endif
 
     infoPtr->imageCreateInfoShallow = vk_make_orphan_copy(*imageCi);
     infoPtr->currentQueueFamilyIndex = mQueueFamilyIndex;
