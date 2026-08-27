@@ -217,14 +217,17 @@ class SharedLibraries {
             return false;
         }
 
-        auto library = SharedLibrary::open(path.c_str());
+        char error[512] = {};
+        auto library = SharedLibrary::open(path.c_str(), error, sizeof(error));
         if (library) {
             mLibs.push_back(library);
             GFXSTREAM_INFO("Added library: %s", path.c_str());
             return true;
         } else {
-            // This is expected when searching for a valid library path
-            GFXSTREAM_DEBUG("Library cannot be added: %s", path.c_str());
+            // Search failures are expected for fallback basenames, but retaining
+            // dlopen's reason is essential on constrained loader namespaces such
+            // as Android applications.
+            GFXSTREAM_WARNING("Vulkan loader cannot be added: %s (%s)", path.c_str(), error);
             return false;
         }
     }
