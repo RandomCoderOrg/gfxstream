@@ -352,7 +352,8 @@ class VkEmulation {
         gfxstream::base::Optional<VkBuffer> bufferForDedicatedAllocation =
             gfxstream::base::kNullopt,
         gfxstream::base::Optional<VkImage> imageForDedicatedAllocation = gfxstream::base::kNullopt,
-        gfxstream::base::Optional<ColorBufferInfo*> colorBufferInfo = gfxstream::base::kNullopt);
+        gfxstream::base::Optional<ColorBufferInfo*> colorBufferInfo = gfxstream::base::kNullopt,
+        VkMemoryPropertyFlags requestedMemoryProperties = 0);
 
     bool importExternalMemory(VulkanDispatch* vk, VkDevice targetDevice,
                               const ExternalMemoryInfo* info,

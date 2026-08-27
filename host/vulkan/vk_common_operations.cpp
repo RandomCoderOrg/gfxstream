@@ -20,6 +20,7 @@
 
 #include <glm/gtc/type_ptr.hpp>
 #include <iomanip>
+#include <limits>
 #include <ostream>
 #include <sstream>
 #include <unordered_set>
@@ -2116,6 +2117,35 @@ static AHardwareBuffer* allocAhb(const VkImageCreateInfo* imageCreateInfo) {
     }
     return ahb;
 }
+
+// Allocate an AHardwareBuffer suitable for backing a Vulkan buffer. Android's
+// native buffer contract represents data buffers as one-dimensional BLOBs:
+// width is the size in bytes, height and layers are one, and GPU_DATA_BUFFER
+// declares shader-buffer use.
+static AHardwareBuffer* allocAhbBuffer(VkDeviceSize size) {
+    if (size == 0 || size > std::numeric_limits<uint32_t>::max()) {
+        GFXSTREAM_WARNING("Cannot allocate AHardwareBuffer BLOB of size %" PRIu64 ".",
+                          static_cast<uint64_t>(size));
+        return nullptr;
+    }
+
+    AHardwareBuffer_Desc desc = {
+        .width = static_cast<uint32_t>(size),
+        .height = 1,
+        .layers = 1,
+        .format = AHARDWAREBUFFER_FORMAT_BLOB,
+        .usage = AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER,
+    };
+
+    AHardwareBuffer* ahb = nullptr;
+    int ahbRes = AHardwareBuffer_allocate(&desc, &ahb);
+    if (ahbRes != 0 || !ahb) {
+        GFXSTREAM_WARNING("AHardwareBuffer BLOB allocation failed (err=%d, size=%" PRIu64 ").",
+                          ahbRes, static_cast<uint64_t>(size));
+        return nullptr;
+    }
+    return ahb;
+}
 #endif
 
 // Precondition: sVkEmulation has valid device support info
@@ -2123,7 +2153,8 @@ bool VkEmulation::allocExternalMemory(VulkanDispatch* vk, VkEmulation::ExternalM
                                       Optional<uint64_t> deviceAlignment,
                                       Optional<VkBuffer> bufferForDedicatedAllocation,
                                       Optional<VkImage> imageForDedicatedAllocation,
-                                      Optional<ColorBufferInfo*> colorBufferInfo) {
+                                      Optional<ColorBufferInfo*> colorBufferInfo,
+                                      VkMemoryPropertyFlags requestedMemoryProperties) {
     VkExportMemoryAllocateInfo exportAi = { // filled, if supported
         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO
     };
@@ -2405,6 +2436,61 @@ bool VkEmulation::allocExternalMemory(VulkanDispatch* vk, VkEmulation::ExternalM
                     cbInfoPtr->handle, cbInfoPtr->width, cbInfoPtr->height,
                     string_VkFormat(cbInfoPtr->imageCreateInfoShallow.format), info->typeIndex,
                     (uint64_t)ahbProps.allocationSize);
+            } else if (bufferForDedicatedAllocation.hasValue()) {
+                AHardwareBuffer* ahb = allocAhbBuffer(info->size);
+                if (!ahb) {
+                    GFXSTREAM_WARNING(
+                        "Falling back to non-exportable allocation for Vulkan buffer.");
+                    break;
+                }
+
+                VkAndroidHardwareBufferPropertiesANDROID ahbProps = {
+                    .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
+                };
+                VkResult propsRes = vk->vkGetAndroidHardwareBufferPropertiesANDROID(
+                    mDevice, ahb, &ahbProps);
+                if (propsRes != VK_SUCCESS) {
+                    GFXSTREAM_WARNING(
+                        "vkGetAndroidHardwareBufferPropertiesANDROID failed for BLOB: %s.",
+                        string_VkResult(propsRes));
+                    AHardwareBuffer_release(ahb);
+                    break;
+                }
+
+                VkMemoryRequirements bufferMemReqs;
+                vk->vkGetBufferMemoryRequirements(mDevice, *bufferForDedicatedAllocation,
+                                                   &bufferMemReqs);
+                const uint32_t combinedBits =
+                    ahbProps.memoryTypeBits & bufferMemReqs.memoryTypeBits;
+                if (!combinedBits || ahbProps.allocationSize < bufferMemReqs.size) {
+                    GFXSTREAM_WARNING(
+                        "AHardwareBuffer BLOB is incompatible with Vulkan buffer "
+                        "(AHB bits=0x%x, buffer bits=0x%x, AHB size=%" PRIu64
+                        ", required=%" PRIu64 ").",
+                        ahbProps.memoryTypeBits, bufferMemReqs.memoryTypeBits,
+                        static_cast<uint64_t>(ahbProps.allocationSize),
+                        static_cast<uint64_t>(bufferMemReqs.size));
+                    AHardwareBuffer_release(ahb);
+                    break;
+                }
+
+                info->typeIndex =
+                    getValidMemoryTypeIndex(combinedBits, requestedMemoryProperties);
+                allocInfo.memoryTypeIndex = info->typeIndex;
+                info->size = ahbProps.allocationSize;
+                allocInfo.allocationSize = ahbProps.allocationSize;
+
+                importAhbInfo.buffer = ahb;
+                vk_append_struct(&allocInfoChain, &importAhbInfo);
+                info->handleInfo = ExternalHandleInfo{
+                    .handle = reinterpret_cast<ExternalHandleType>(ahb),
+                    .streamHandleType = STREAM_HANDLE_TYPE_PLATFORM_AHB,
+                };
+
+                GFXSTREAM_DEBUG(
+                    "Imported AHardwareBuffer BLOB into Vulkan buffer "
+                    "(memoryTypeIndex=%u, size=%" PRIu64 ")",
+                    info->typeIndex, static_cast<uint64_t>(ahbProps.allocationSize));
             }
 #endif
             break;
@@ -4548,8 +4634,16 @@ bool VkEmulation::setupVkBuffer(uint64_t size, uint32_t bufferHandle, bool vulka
     bool isHostVisible = memoryProperty & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
     Optional<uint64_t> deviceAlignment =
         isHostVisible ? Optional<uint64_t>(memReqs.alignment) : kNullopt;
-    Optional<VkBuffer> dedicated_buffer = useDedicated ? Optional<VkBuffer>(res.buffer) : kNullopt;
-    bool allocRes = allocExternalMemory(vk, &res.memory, deviceAlignment, dedicated_buffer);
+    // An imported AHardwareBuffer is a dedicated external allocation even when
+    // the physical device does not require ordinary VkBuffer allocations to be
+    // dedicated. Passing the buffer here also selects the Android BLOB backing
+    // path in allocExternalMemory().
+    const bool useAhbBacking =
+        getExternalMemoryMode() == ExternalMemory::Mode::AndroidAHB;
+    Optional<VkBuffer> dedicated_buffer =
+        (useDedicated || useAhbBacking) ? Optional<VkBuffer>(res.buffer) : kNullopt;
+    bool allocRes = allocExternalMemory(vk, &res.memory, deviceAlignment, dedicated_buffer,
+                                        kNullopt, kNullopt, memoryProperty);
 
     if (!allocRes) {
         GFXSTREAM_WARNING("Failed to allocate ColorBuffer with Vulkan backing.");
