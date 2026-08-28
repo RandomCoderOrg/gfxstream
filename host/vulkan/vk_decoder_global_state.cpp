@@ -177,6 +177,8 @@ static std::atomic<uint64_t> sNextHostBlobId{1};
 static std::atomic<uint64_t> sUniqueShmemId = 0;
 
 class VkDecoderGlobalState::Impl {
+    friend class VkDecoderGlobalState;
+
    public:
     Impl(VkEmulation* emulation)
         : m_vk(vkDispatch()) {
@@ -6585,7 +6587,16 @@ class VkDecoderGlobalState::Impl {
                 importWin32HandleInfo.handle =
                     managedHandle.get().value_or(static_cast<HANDLE>(NULL));
                 vk_append_struct(&structChainIter, &importWin32HandleInfo);
-#elif !defined(__ANDROID__)
+#elif defined(__ANDROID__)
+                if (dupHandleInfo->streamHandleType != STREAM_HANDLE_TYPE_PLATFORM_AHB) {
+                    GFXSTREAM_ERROR(
+                        "Buffer object %d has unsupported Android external handle type 0x%x",
+                        importBufferInfoPtr->buffer, dupHandleInfo->streamHandleType);
+                    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                }
+                importInfo.buffer = reinterpret_cast<AHardwareBuffer*>(dupHandleInfo->handle);
+                vk_append_struct(&structChainIter, &importInfo);
+#else
                 importFdInfo.fd = dupHandleInfo->getFd();
                 vk_append_struct(&structChainIter, &importFdInfo);
 #endif
@@ -9942,10 +9953,16 @@ class VkDecoderGlobalState::Impl {
                 const_cast<VkImageCreateInfo&>(pImageCreateInfos[i]);
             VkExternalMemoryImageCreateInfo* pExternalMemoryImageCi =
                 vk_find_struct<VkExternalMemoryImageCreateInfo>(&imageCreateInfo);
-            bool importAndroidHardwareBuffer =
+            const bool guestDmaBufBackedByAndroidHardwareBuffer =
                 pExternalMemoryImageCi &&
                 (pExternalMemoryImageCi->handleTypes &
-                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
+                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
+                m_vkEmulation->getExternalMemoryMode() == ExternalMemory::Mode::AndroidAHB;
+            bool importAndroidHardwareBuffer =
+                pExternalMemoryImageCi &&
+                ((pExternalMemoryImageCi->handleTypes &
+                  VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID) ||
+                 guestDmaBufBackedByAndroidHardwareBuffer);
             const VkNativeBufferANDROID* pNativeBufferANDROID =
                 vk_find_struct<VkNativeBufferANDROID>(&imageCreateInfo);
 
@@ -10545,6 +10562,39 @@ class VkDecoderGlobalState::Impl {
         }
 
         return ret;
+    }
+
+    int sendColorBufferMemoryAhbToSocket(uint32_t colorBufferHandle, int socketFd) {
+#ifdef __ANDROID__
+        if (socketFd < 0) return -EINVAL;
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        for (const auto& [memory, memoryInfo] : mMemoryInfo) {
+            if (!memoryInfo.boundColorBuffer ||
+                *memoryInfo.boundColorBuffer != colorBufferHandle) {
+                continue;
+            }
+
+            auto* deviceInfo = gfxstream::base::find(mDeviceInfo, memoryInfo.device);
+            if (!deviceInfo || !deviceInfo->boxed) return -ENODEV;
+            VulkanDispatch* vk = dispatch_VkDevice(deviceInfo->boxed);
+            auto handle = exportMemoryHandle(deviceInfo, vk, memoryInfo.device, memory);
+            if (!handle || handle->streamHandleType != STREAM_HANDLE_TYPE_PLATFORM_AHB ||
+                !handle->handle) {
+                return -ENOTSUP;
+            }
+
+            auto* ahb = reinterpret_cast<AHardwareBuffer*>(handle->handle);
+            const int result = AHardwareBuffer_sendHandleToUnixSocket(ahb, socketFd);
+            AHardwareBuffer_release(ahb);
+            return result;
+        }
+        return -ENOENT;
+#else
+        (void)colorBufferHandle;
+        (void)socketFd;
+        return -ENOTSUP;
+#endif
     }
 
     void getSupportedSemaphoreHandleTypes(VulkanDispatch* vk, VkPhysicalDevice physicalDevice,
@@ -12140,6 +12190,11 @@ uint8_t* VkDecoderGlobalState::getMappedHostPointer(VkDeviceMemory memory) {
 
 VkDeviceSize VkDecoderGlobalState::getDeviceMemorySize(VkDeviceMemory memory) {
     return mImpl->getDeviceMemorySize(memory);
+}
+
+int VkDecoderGlobalState::sendColorBufferMemoryAhbToSocket(uint32_t colorBufferHandle,
+                                                           int socketFd) {
+    return mImpl->sendColorBufferMemoryAhbToSocket(colorBufferHandle, socketFd);
 }
 
 bool VkDecoderGlobalState::usingDirectMapping() const { return mImpl->usingDirectMapping(); }

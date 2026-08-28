@@ -570,6 +570,22 @@ bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* v
     }
 
     VkResult res = mGetImageFormatProperties2Func(physdev, &formatInfo2, &outProps2);
+    bool queriedWithoutExternalMemory = false;
+
+#if defined(__ANDROID__)
+    // An Android device can support a Vulkan format for ordinary images while
+    // rejecting it for AHardwareBuffer import/export (BGRA8 is a common
+    // example). Do not erase the base Vulkan capability merely because the
+    // optional transport capability is absent.
+    if (res == VK_ERROR_FORMAT_NOT_SUPPORTED &&
+        getExternalMemoryMode() == ExternalMemory::Mode::AndroidAHB &&
+        formatInfo2.pNext != nullptr) {
+        formatInfo2.pNext = nullptr;
+        outProps2.pNext = nullptr;
+        res = mGetImageFormatProperties2Func(physdev, &formatInfo2, &outProps2);
+        queriedWithoutExternalMemory = res == VK_SUCCESS;
+    }
+#endif
 
     if (res != VK_SUCCESS) {
         if (res == VK_ERROR_FORMAT_NOT_SUPPORTED) {
@@ -604,7 +620,7 @@ bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* v
     VkExternalMemoryHandleTypeFlags compatibleHandleTypes =
         outExternalProps.externalMemoryProperties.compatibleHandleTypes;
 
-    info->supportsExternalMemory = supportsExternalMemory() &&
+    info->supportsExternalMemory = !queriedWithoutExternalMemory && supportsExternalMemory() &&
                                 (getDefaultExternalMemoryHandleType() & compatibleHandleTypes) &&
                                 (VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT & featureFlags) &&
                                 (VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT & featureFlags);
@@ -614,7 +630,7 @@ bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* v
 
     info->imageFormatProps2 = outProps2;
     info->extFormatProps = outExternalProps;
-    info->imageFormatProps2.pNext = &info->extFormatProps;
+    info->imageFormatProps2.pNext = queriedWithoutExternalMemory ? nullptr : &info->extFormatProps;
 
     GFXSTREAM_DEBUG("Supported: %s %s %s %s, supportsExternalMemory? %d, requiresDedicated? %d",
                     string_VkFormat(info->format), string_VkImageType(info->type),
@@ -2063,6 +2079,14 @@ MTLResource_id VkEmulation::getMtlResourceFromVkDeviceMemory(VulkanDispatch* vk,
 #endif
 
 #ifdef __ANDROID__
+static bool canUseStandardAndroidAhbColorFormat(VkFormat format) {
+    // The public AHardwareBuffer color contract guarantees RGBA8. Android's
+    // historical BGRA value is deprecated and is rejected by current Mali
+    // gralloc implementations. Non-display guest images must remain ordinary
+    // host Vulkan allocations instead of being forced through that transport.
+    return format == VK_FORMAT_R8G8B8A8_UNORM;
+}
+
 // Allocate an AHardwareBuffer matching the given image's format, extent and usage.
 // Returns nullptr on failure (caller falls back to the non-AHB allocation path).
 static AHardwareBuffer* allocAhb(const VkImageCreateInfo* imageCreateInfo) {
@@ -2377,6 +2401,11 @@ bool VkEmulation::allocExternalMemory(VulkanDispatch* vk, VkEmulation::ExternalM
             if (colorBufferInfo) {
                 auto cbInfoPtr = *colorBufferInfo;
 
+                if (!canUseStandardAndroidAhbColorFormat(
+                        cbInfoPtr->imageCreateInfoShallow.format)) {
+                    break;
+                }
+
                 AHardwareBuffer* ahb = allocAhb(&cbInfoPtr->imageCreateInfoShallow);
                 if (!ahb) {
                     GFXSTREAM_WARNING(
@@ -2570,6 +2599,19 @@ bool VkEmulation::allocExternalMemory(VulkanDispatch* vk, VkEmulation::ExternalM
     if (!mDeviceInfo.supportsExternalMemoryExport) {
         return true;
     }
+
+#if defined(__ANDROID__)
+    // A resource which deliberately fell back from the AHB transport is a
+    // host-internal Vulkan allocation. Calling
+    // vkGetMemoryAndroidHardwareBufferANDROID on memory that was neither
+    // exported nor imported as AHB is invalid on vendor drivers and can crash
+    // them. The gfxstream color-buffer ID remains sufficient for guest command
+    // decoding; only presentable/exported resources need an OS handle.
+    if (mDeviceInfo.externalMemoryMode == ExternalMemory::Mode::AndroidAHB &&
+        !info->handleInfo) {
+        return true;
+    }
+#endif
 
     uint32_t streamHandleType = 0;
     VkResult exportRes = VK_SUCCESS;
@@ -3015,11 +3057,21 @@ std::unique_ptr<VkImageCreateInfo> VkEmulation::generateColorBufferVkImageCreate
         usage |= (tilingFeatures & formatUsage.first) ? formatUsage.second : 0u;
     }
 
+    VkImageCreateFlags createFlags = imageSupportInfo.createFlags;
+#if defined(__ANDROID__)
+    if (getExternalMemoryMode() == ExternalMemory::Mode::AndroidAHB &&
+        canUseStandardAndroidAhbColorFormat(format)) {
+        /* ColorBuffers and guest images are distinct VkImage aliases of the
+         * same imported AHardwareBuffer allocation. */
+        createFlags |= VK_IMAGE_CREATE_ALIAS_BIT;
+    }
+#endif
+
     return std::make_unique<VkImageCreateInfo>(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         // The caller is responsible to fill pNext.
         .pNext = nullptr,
-        .flags = imageSupportInfo.createFlags,
+        .flags = createFlags,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = format,
         .extent =
@@ -3146,9 +3198,23 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     mColorBuffers[colorBufferHandle] = res;
     auto infoPtr = &mColorBuffers[colorBufferHandle];
 
-    VkImageTiling tiling = (infoPtr->memoryProperty & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
-                               ? VK_IMAGE_TILING_LINEAR
-                               : VK_IMAGE_TILING_OPTIMAL;
+    const bool useAndroidAhb =
+#if defined(__ANDROID__)
+        getExternalMemoryMode() == ExternalMemory::Mode::AndroidAHB &&
+        canUseStandardAndroidAhbColorFormat(vkFormat);
+#else
+        false;
+#endif
+
+    VkImageTiling tiling =
+#if defined(__ANDROID__)
+        useAndroidAhb
+            ? VK_IMAGE_TILING_LINEAR
+            :
+#endif
+        (infoPtr->memoryProperty & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            ? VK_IMAGE_TILING_LINEAR
+            : VK_IMAGE_TILING_OPTIMAL;
     std::unique_ptr<VkImageCreateInfo> imageCi = generateColorBufferVkImageCreateInfoLocked(
         vkFormat, infoPtr->width, infoPtr->height, tiling, mipLevels);
     // pNext will be filled later.
@@ -3165,7 +3231,8 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     VkExternalMemoryImageCreateInfo extImageCi = {
         VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO
     };
-    if (mDeviceInfo.supportsExternalMemoryExport || mDeviceInfo.supportsExternalMemoryImport) {
+    if ((mDeviceInfo.supportsExternalMemoryExport || mDeviceInfo.supportsExternalMemoryImport) &&
+        (getExternalMemoryMode() != ExternalMemory::Mode::AndroidAHB || useAndroidAhb)) {
         // If external memory is supported (either by import or export), then append
         // VkExternalMemoryImageCreateInfo unconditionally, as it may be backed by external memory.
         extImageCi.handleTypes =
@@ -3188,7 +3255,7 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
     // Vulkan requires memory imported from an AHardwareBuffer and bound to an
     // image to use a dedicated allocation. This requirement is intrinsic to
     // AHB imports and does not depend on VkMemoryDedicatedRequirements.
-    if (getExternalMemoryMode() == ExternalMemory::Mode::AndroidAHB) {
+    if (useAndroidAhb) {
         useDedicated = true;
     }
 #endif

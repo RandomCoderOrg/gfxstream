@@ -543,6 +543,10 @@ class VkDecoderGlobalState {
 
     uint8_t* getMappedHostPointer(VkDeviceMemory memory);
     VkDeviceSize getDeviceMemorySize(VkDeviceMemory memory);
+
+    // Export the Android hardware buffer backing guest Vulkan memory associated
+    // with a virtio-gpu ColorBuffer directly to a connected Unix socket.
+    int sendColorBufferMemoryAhbToSocket(uint32_t colorBufferHandle, int socketFd);
     bool usingDirectMapping() const;
 
     struct HostFeatureSupport {

@@ -41,6 +41,7 @@ extern "C" {
 #include "render-utils/RenderLib.h"
 #include "virtio_gpu_frontend.h"
 #include "vulkan/vk_utils.h"
+#include "vulkan/vk_decoder_global_state.h"
 #include "vulkan/vulkan_dispatch.h"
 
 
@@ -452,6 +453,14 @@ VG_EXPORT int stream_renderer_resource_send_hardware_buffer(uint32_t res_handle,
 #if defined(__ANDROID__)
     if (socket_fd < 0) {
         return -EINVAL;
+    }
+
+    if (auto* decoder = gfxstream::host::vk::VkDecoderGlobalState::get()) {
+        const int guest_memory_result =
+            decoder->sendColorBufferMemoryAhbToSocket(res_handle, socket_fd);
+        if (guest_memory_result == 0) {
+            return 0;
+        }
     }
 
     struct stream_renderer_handle handle = {};
